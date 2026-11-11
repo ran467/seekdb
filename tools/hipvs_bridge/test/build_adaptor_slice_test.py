@@ -75,6 +75,11 @@ struct ObTimeUtility {
   static int64_t current_time() { return 0; }
 };
 
+#ifdef _WIN32
+#define setenv(name, value, overwrite) _putenv_s(name, value)
+#include <stdlib.h>
+#endif
+
 #define K(x) (x)
 #define KP(x) (x)
 #define LOG_INFO(...) do {} while (0)
@@ -173,6 +178,51 @@ int main() {
   if (rc != OB_SUCCESS) { printf("deserialize failed rc=%d\n", rc); return 1; }
   if (g_deserialize_calls != 1) { printf("bridge deserialize not called\n"); return 1; }
   printf("deserialize ok\n");
+
+  // Build a second index over different data: it replaces the cached index.
+  ObCuvsEntry *ent2 = new ObCuvsEntry();
+  ent2->dim_ = 4;
+  ent2->buf_ids_.assign(n, 22);
+  ent2->buf_vecs_.assign(n * 4, 1.5f);
+  ent2->built_n_ = n;
+  ent2->bridge_ = std::shared_ptr<void>((void *)0x3, [](void *) {});
+  {
+    std::lock_guard<std::mutex> guard(g_ob_cuvs_mu);
+    g_ob_cuvs_reg[(void *)0x4] = ent2;
+  }
+  std::ostringstream out_second(std::ios::binary);
+  ob_cuvs_serialize((void *)0x4, out_second, ret);
+  printf("second snapshot built\n");
+
+  // With the reuse enabled, a snapshot that does NOT describe the cached index
+  // must still be loaded from disk.
+  setenv("OB_CUVS_REUSE_BUILT", "1", 1);
+  {
+    std::istringstream mismatched(out.str(), std::ios::binary);
+    char magic[8] = {0};
+    mismatched.read(magic, 8);
+    const int rc_mismatch = ob_cuvs_deserialize((void *)0x5, 4, mismatched);
+    if (rc_mismatch != OB_SUCCESS) { printf("mismatch deserialize failed rc=%d\n", rc_mismatch); return 1; }
+    if (g_deserialize_calls != 2) {
+      printf("mismatching snapshot was wrongly reused (bridge calls=%d)\n", g_deserialize_calls);
+      return 1;
+    }
+    printf("mismatch ok (not reused)\n");
+  }
+
+  // The snapshot of the index that is cached must be served from memory.
+  {
+    std::istringstream matching(out_second.str(), std::ios::binary);
+    char magic[8] = {0};
+    matching.read(magic, 8);
+    const int rc_match = ob_cuvs_deserialize((void *)0x6, 4, matching);
+    if (rc_match != OB_SUCCESS) { printf("reuse deserialize failed rc=%d\n", rc_match); return 1; }
+    if (g_deserialize_calls != 2) {
+      printf("matching snapshot was not reused (bridge calls=%d)\n", g_deserialize_calls);
+      return 1;
+    }
+    printf("reuse ok (bridge reload skipped)\n");
+  }
 
   printf("PASS\n");
   return 0;

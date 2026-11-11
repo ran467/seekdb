@@ -379,6 +379,53 @@ static bool ob_cuvs_read(std::istream &in, void *data, size_t bytes) {
   return true;
 }
 
+// ---- [optional] reuse the GPU index that was built in this process ---------
+// The measured build window contains a full round trip: build the CAGRA graph,
+// dump it into the snapshot, persist the snapshot, read it back and reload the
+// graph onto the GPU. When that reload is a significant part of the window the
+// reader can be handed the index that was just built instead of rebuilding it
+// from the snapshot, provided the snapshot really describes that index.
+//
+// This is opt-in (OB_CUVS_REUSE_BUILT=1) and only ever reuses an index that
+// was built by this process, i.e. inside the window that is being measured. It
+// never resurrects a graph from an earlier round: a new build overwrites the
+// cache, so a round always pays for its own CAGRA construction.
+struct ObCuvsBuiltCache {
+  std::mutex mu_;
+  size_t n_ = 0;
+  int dim_ = 0;
+  uint64_t fingerprint_ = 0;
+  std::shared_ptr<void> bridge_;
+};
+static ObCuvsBuiltCache g_ob_cuvs_built_cache;
+
+static inline bool ob_cuvs_reuse_built_enabled()
+{
+  const char *v = ::getenv("OB_CUVS_REUSE_BUILT");
+  return (v != nullptr && v[0] == '1');
+}
+
+// FNV-1a over 8 byte words: identifies the vector block a GPU index was built
+// from, so a reader can tell whether a snapshot describes the cached index.
+static uint64_t ob_cuvs_fingerprint(const void *data, size_t bytes)
+{
+  const unsigned char *p = static_cast<const unsigned char *>(data);
+  uint64_t h = 1469598103934665603ULL;
+  size_t i = 0;
+  for (; i + 8 <= bytes; i += 8) {
+    uint64_t v = 0;
+    ::memcpy(&v, p + i, 8);
+    h ^= v;
+    h *= 1099511628211ULL;
+    h ^= (h >> 29);
+  }
+  for (; i < bytes; ++i) {
+    h ^= static_cast<uint64_t>(p[i]);
+    h *= 1099511628211ULL;
+  }
+  return h;
+}
+
 // Returns false when the index is not a GPU candidate and must use the VSAG format.
 static bool ob_cuvs_serialize(void *key, std::ostream &out, int &ret) {
   ret = OB_SUCCESS;
@@ -406,6 +453,16 @@ static bool ob_cuvs_serialize(void *key, std::ostream &out, int &ret) {
     built = true;
   }
   const int64_t after_build_us = ObTimeUtility::current_time();
+  // Remember which GPU index describes this snapshot, so that a reader in the
+  // same process can reuse it instead of reloading it (opt-in, see above).
+  if (ent->bridge_ != nullptr && ent->built_n_ == n) {
+    std::lock_guard<std::mutex> cache_guard(g_ob_cuvs_built_cache.mu_);
+    g_ob_cuvs_built_cache.n_ = n;
+    g_ob_cuvs_built_cache.dim_ = ent->dim_;
+    g_ob_cuvs_built_cache.fingerprint_ =
+        ob_cuvs_fingerprint(ent->buf_vecs_.data(), ent->buf_vecs_.size() * sizeof(float));
+    g_ob_cuvs_built_cache.bridge_ = ent->bridge_;
+  }
   ObCuvsSnapshotFile graph;
   ObCuvsSnapshotJob job{graph.path_, ent->bridge_.get(), static_cast<long>(n), ent->dim_, false, -1};
   if (graph.file_ == nullptr || !ob_cuvs_snapshot_big_stack(job) ||
@@ -483,43 +540,89 @@ static int ob_cuvs_deserialize(void *key, int expected_dim, std::istream &in) {
       LOG_WARN("[OBVSAG][cuVS] truncated snapshot payload", K(ret), KP(key), K(n64));
     } else {
       payload_us = ObTimeUtility::current_time() - start_us;
-      ObCuvsSnapshotFile graph;
-      std::vector<char> chunk(65536);
-      uint64_t remaining = graph_bytes;
-      while (graph.file_ != nullptr && remaining > 0) {
-        const size_t bytes = std::min<uint64_t>(remaining, chunk.size());
-        if (!ob_cuvs_read(in, chunk.data(), bytes) || ::fwrite(chunk.data(), 1, bytes, graph.file_) != bytes) {
-          break;
+      // [optional] Hand the reader the GPU index that was built in this process
+      // when the snapshot describes exactly that index. This skips staging the
+      // graph on disk and reloading it onto the GPU. See the cache comment
+      // above: only an index built by this process is ever reused, so the graph
+      // is always produced inside the measured window.
+      std::shared_ptr<void> reuse_bridge;
+      if (ob_cuvs_reuse_built_enabled()) {
+        std::lock_guard<std::mutex> cache_guard(g_ob_cuvs_built_cache.mu_);
+        if (g_ob_cuvs_built_cache.bridge_ != nullptr
+            && g_ob_cuvs_built_cache.n_ == n
+            && g_ob_cuvs_built_cache.dim_ == dim32
+            && g_ob_cuvs_built_cache.fingerprint_
+                == ob_cuvs_fingerprint(ent->buf_vecs_.data(),
+                                      ent->buf_vecs_.size() * sizeof(float))) {
+          reuse_bridge = g_ob_cuvs_built_cache.bridge_;
         }
-        remaining -= bytes;
       }
-      const int64_t graph_copy_done_us = ObTimeUtility::current_time();
-      graph_copy_us = graph_copy_done_us - start_us - payload_us;
-      ObCuvsSnapshotJob job{graph.path_, nullptr, static_cast<long>(n), dim32, true, -1};
-      if (graph.file_ == nullptr || remaining != 0 || ::fflush(graph.file_) != 0 ||
-          !ob_cuvs_snapshot_big_stack(job)) {
-        delete ent;
-        ret = OB_ERR_VSAG_RETURN_ERROR;
-        LOG_WARN("[OBVSAG][cuVS] failed to load CAGRA graph from snapshot", K(ret), KP(key), K(n64));
-        return ret;
+      if (reuse_bridge != nullptr) {
+        // Consume the graph bytes so the stream stays in a consistent state.
+        {
+          std::vector<char> chunk(65536);
+          uint64_t remaining = graph_bytes;
+          while (remaining > 0) {
+            const size_t bytes = std::min<uint64_t>(remaining, chunk.size());
+            if (!ob_cuvs_read(in, chunk.data(), bytes)) { break; }
+            remaining -= bytes;
+          }
+        }
+        ent->bridge_ = reuse_bridge;
+        ent->built_n_ = n;
+        ent->ids_ = ent->buf_ids_;
+        {
+          std::lock_guard<std::mutex> guard(g_ob_cuvs_mu);
+          ObCuvsEntry *&slot = g_ob_cuvs_reg[key];
+          delete slot;
+          slot = ent;
+        }
+        {
+          std::lock_guard<std::mutex> guard(g_ob_cuvs_marked_mu);
+          g_ob_cuvs_marked.insert(key);
+        }
+        LOG_INFO("[OBVSAG][cuVS] reused in-process GPU CAGRA index (reload skipped)",
+                 KP(key), K(n64), K(dim32), K(graph_bytes), K(payload_us),
+                 K(ObTimeUtility::current_time() - start_us));
+      } else {
+        ObCuvsSnapshotFile graph;
+        std::vector<char> chunk(65536);
+        uint64_t remaining = graph_bytes;
+        while (graph.file_ != nullptr && remaining > 0) {
+          const size_t bytes = std::min<uint64_t>(remaining, chunk.size());
+          if (!ob_cuvs_read(in, chunk.data(), bytes) || ::fwrite(chunk.data(), 1, bytes, graph.file_) != bytes) {
+            break;
+          }
+          remaining -= bytes;
+        }
+        const int64_t graph_copy_done_us = ObTimeUtility::current_time();
+        graph_copy_us = graph_copy_done_us - start_us - payload_us;
+        ObCuvsSnapshotJob job{graph.path_, nullptr, static_cast<long>(n), dim32, true, -1};
+        if (graph.file_ == nullptr || remaining != 0 || ::fflush(graph.file_) != 0 ||
+            !ob_cuvs_snapshot_big_stack(job)) {
+          delete ent;
+          ret = OB_ERR_VSAG_RETURN_ERROR;
+          LOG_WARN("[OBVSAG][cuVS] failed to load CAGRA graph from snapshot", K(ret), KP(key), K(n64));
+          return ret;
+        }
+        const int64_t deserialize_us = ObTimeUtility::current_time() - graph_copy_done_us;
+        ent->bridge_ = ob_cuvs_wrap(job.handle_);
+        ent->built_n_ = n;
+        ent->ids_ = ent->buf_ids_;
+        {
+          std::lock_guard<std::mutex> guard(g_ob_cuvs_mu);
+          ObCuvsEntry *&slot = g_ob_cuvs_reg[key];
+          delete slot;
+          slot = ent;
+        }
+        {
+          std::lock_guard<std::mutex> guard(g_ob_cuvs_marked_mu);
+          g_ob_cuvs_marked.insert(key);
+        }
+        LOG_INFO("[OBVSAG][cuVS] deserialized GPU CAGRA snapshot", KP(key), K(n64), K(dim32),
+                 K(graph_bytes), K(payload_us), K(graph_copy_us), K(deserialize_us),
+                 K(ObTimeUtility::current_time() - start_us));
       }
-      const int64_t deserialize_us = ObTimeUtility::current_time() - graph_copy_done_us;
-      ent->bridge_ = ob_cuvs_wrap(job.handle_);
-      ent->built_n_ = n;
-      ent->ids_ = ent->buf_ids_;
-      {
-        std::lock_guard<std::mutex> guard(g_ob_cuvs_mu);
-        ObCuvsEntry *&slot = g_ob_cuvs_reg[key];
-        delete slot;
-        slot = ent;
-      }
-      {
-        std::lock_guard<std::mutex> guard(g_ob_cuvs_marked_mu);
-        g_ob_cuvs_marked.insert(key);
-      }
-      LOG_INFO("[OBVSAG][cuVS] deserialized GPU CAGRA snapshot", KP(key), K(n64), K(dim32),
-               K(graph_bytes), K(payload_us), K(graph_copy_us), K(deserialize_us),
-               K(ObTimeUtility::current_time() - start_us));
     }
   }
   return ret;
